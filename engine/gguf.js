@@ -178,14 +178,14 @@ export const GGML_OUTPUT = "output.weight"; // absent when embeddings are tied
 // Build the engine's weight structure from a parsed GGUF header.
 // bytesOf: async (info) => Uint8Array of that tensor's data (local slice or
 // HTTP range fetch — same contract as the safetensors shard path).
-export async function ggufEntry(G, bytesOf, name, optional, onBytes = () => {}) {
+export async function ggufEntry(G, bytesOf, name, optional, onBytes = () => {}, loadOpts = {}) {
   const info = G.tensors[name];
   if (!info) {
     if (optional) return null;
     throw new Error("missing tensor " + name);
   }
   // the embedding stays on the CPU too (per-token row lookups), so it takes the normal path
-  if (G.streamEntry && name !== GGML_EMBED && info.shape.length === 2 && (info.ggmlType === GGML_Q8_0 || info.ggmlType === GGML_Q4_0)) {
+  if (!loadOpts.cpuBacked && G.streamEntry && name !== GGML_EMBED && info.shape.length === 2 && (info.ggmlType === GGML_Q8_0 || info.ggmlType === GGML_Q4_0)) {
     const e = await G.streamEntry(info);
     if (e) { onBytes(info.byteLength); return e; }
   }
@@ -231,10 +231,10 @@ export function requantQ8Streaming(info, bytes) {
   return { qs, scales };
 }
 
-export async function ggufWeights(G, bytesOf, { lo, hi, hasEmbed, hasHead }, onProgress = () => {}, onEntry = null) {
+export async function ggufWeights(G, bytesOf, { lo, hi, hasEmbed, hasHead }, onProgress = () => {}, onEntry = null, loadOpts = {}) {
   let fetched = 0;
   const entry = async (name, optional) => {
-    const e = await ggufEntry(G, bytesOf, name, optional, (b) => { fetched += b; onProgress(fetched); });
+    const e = await ggufEntry(G, bytesOf, name, optional, (b) => { fetched += b; onProgress(fetched); }, loadOpts);
     if (e && onEntry) onEntry(e, name);
     return e;
   };
@@ -446,10 +446,10 @@ export function qwen35LayerNames(i, forceFull = false) {
     wOut: p + "ssm_out.weight" };
 }
 
-export async function qwen35Weights(G, bytesOf, { lo, hi, hasEmbed, hasHead, mtp = false }, onProgress = () => {}, onEntry = null) {
+export async function qwen35Weights(G, bytesOf, { lo, hi, hasEmbed, hasHead, mtp = false }, onProgress = () => {}, onEntry = null, loadOpts = {}) {
   let fetched = 0;
   const entry = async (name, optional) => {
-    const e = await ggufEntry(G, bytesOf, name, optional, (b) => { fetched += b; onProgress(fetched); });
+    const e = await ggufEntry(G, bytesOf, name, optional, (b) => { fetched += b; onProgress(fetched); }, loadOpts);
     if (e && onEntry) onEntry(e, name);
     return e;
   };
