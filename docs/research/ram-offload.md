@@ -100,69 +100,60 @@ pageable 대상으로 둘 것:
 
 ### Phase 2 — WeightPager
 
-새 파일:
+1차 구현 완료.
 
 - `engine/weight_pager.js`
+- VRAM budget 검사
+- reusable named GPU slot
+- Q4/Q8 packed weight batch upload
+- slot grow/reuse
+- transfer bytes / timing 통계
+- 이전 compute 완료 barrier
+- fake GPUDevice 기반 unit test
 
-역할:
-
-- user-defined VRAM budget
-- reusable residency window
-- upload / evict
-- transfer bytes / timing 수집
-- 가능하면 double buffering
-
-예상 변경량: 약 180~300 LOC + tests.
+아직 double buffering은 없다. 현재는 correctness 우선으로 layer 전환 시 보수적으로
+GPU 완료를 기다린다.
 
 ### Phase 3 — Qwen35Engine paged binding
 
-가장 큰 변경.
+1-layer prototype 동작 경로 구현.
 
-현재 `buildLayer()`, `mv()`, `mvB()`, `guOp()` 등이
-permanent GPUBuffer를 물고 있는 bind group을 생성한다.
+- large projection matrix는 초기화 때 GPU에 올리지 않음
+- 각 layer의 CPU packed entry를 `WeightPager` slot으로 materialize
+- 해당 slot을 물고 matvec bind group을 생성한 뒤 즉시 layer 실행
+- FFN / full attention / DeltaNet projection 모두 pageable
+- norm / bias / recurrent state / KV cache는 resident 유지
+- LM head는 현재 resident 유지
 
-paged 모드에서는 두 선택지가 있다.
-
-A. window가 바뀔 때 bind group을 다시 만든다.
-
-B. 고정 크기 GPU slot을 만들고 새 weight를 같은 slot에 복사해서 bind group은 유지한다.
-
-B를 우선한다.
-브라우저에서 bind-group churn을 줄일 수 있고 실행 경로도 더 예측 가능하다.
-
-예상 변경량: 약 300~500 LOC.
+현재 구현은 bind group을 layer마다 다시 만든다.
+최종적으로는 slot handle이 안정된 뒤 bind group 재사용 캐시를 넣는 쪽이 목표다.
 
 ### Phase 4 — residency window 단위 command submission
 
-현재:
+1차 single-token 경로 구현.
 
-```
-모든 local layer encode
--> submit 1회
-```
-
-paged 모드:
+현재 paged 모드는 **window size = 1 layer**로 동작한다.
 
 ```js
-for (const window of pager.windows) {
-  await pager.ensure(window);
-  const enc = device.createCommandEncoder();
-  for (const layer of window.layers) encodeLayer(enc, layer);
-  device.queue.submit([enc.finish()]);
+for (const layer of localLayers) {
+  await pager.materialize(layer.weights);
+  encode(layer);
+  submit();
 }
 ```
 
-수정 대상:
+적용됨:
 
-- single-token decode
-- `_runBatchAndRead()`
-- `prefillTokens()`
-- speculative verify
-- worker hidden-state execution
+- single-token prefill
+- host `embedRun()`
+- worker `runHidden()`
+- solo `forwardToken()`
 
-activation과 recurrent/KV state는 window 사이에도 GPU에 유지한다.
+paged 모드에서는 아직 batched prefill / speculative decode를 비활성화하고
+기존 single-token 경로로 fallback한다. 정확성 확인 후 multi-layer window,
+batched path, double buffering 순서로 다시 올릴 예정이다.
 
-예상 변경량: 약 150~250 LOC.
+activation과 recurrent/KV state는 layer 전환 사이에도 GPU에 유지한다.
 
 ### Phase 5 — room/UI
 
@@ -216,3 +207,22 @@ aggregate VRAM이 충분하면 기존 fully-resident sharding을 기본값으로
 - recurrent/KV state paging
 - 모든 model architecture 지원
 - dense paging에서도 resident mode와 비슷한 decode 속도를 약속
+
+## 현재 테스트 방법
+
+개발 서버에서 Qwen3.8-27B를 선택한 뒤 URL query로 paging을 켠다.
+
+```
+?ramOffload=1&gpuWeightGB=2
+```
+
+- `ramOffload=1`: CPU-backed GGUF + Qwen35 pager 활성
+- `gpuWeightGB`: pageable weight slot에 허용할 VRAM budget
+
+현재 `gpuWeightGB`는 **전체 GPU 사용량이 아니라 pageable matrix slot budget**이다.
+LM head, KV cache, recurrent state, working buffer는 별도 resident이므로 8GB GPU에서
+이 값을 8로 주면 실제 사용량은 8GB를 넘을 수 있다. 4060 8GB에서는 첫 테스트를
+1~2GB 정도로 시작하는 편이 안전하다.
+
+생성 완료 통계에 `paged X.XX GB / Y.Ys upload`가 표시되면 실제 RAM -> GPU paging이
+발생한 것이다.
