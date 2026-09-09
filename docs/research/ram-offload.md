@@ -160,22 +160,24 @@ activation과 recurrent/KV state는 layer 전환 사이에도 GPU에 유지한�
 
 ### Phase 5 — room/UI
 
-현재 `contribGB` 하나로 표현되는 용량을 분리한다.
+메타데이터/플래너 1차 연결 완료.
 
-- GPU resident weight budget
-- CPU/offload weight budget
+- paging 노드는 `cpuWeightGB`와 `gpuWeightGB`를 따로 광고
+- `contribGB`는 paging 모드에서 CPU weight budget 역할
+- host shard planner는 paging 노드의 CPU weight budget으로 layer를 배정
+- peer card에 `RAM X GB · GPU page Y GB` 표시
+- `ramWindowLayers`도 peer metadata에 포함
 
 예:
 
 ```
-GPU weight budget: 5.5 GB
+GPU page budget: 2 GB
 CPU weight budget: 28 GB
 ```
 
-shard planner는 CPU budget보다 큰 shard를 배정하지 않고,
-local pager는 GPU budget만큼만 동시에 resident하게 만든다.
-
-예상 변경량: 약 100~180 LOC.
+아직 join 화면에 별도 advanced UI는 없다.
+현재는 `gpuWeightGB`, `ramWindowLayers`를 URL query로 설정하고,
+CPU weight budget은 기존 memory pledge 입력을 사용한다.
 
 ## 대략적인 전체 규모
 
@@ -222,6 +224,7 @@ aggregate VRAM이 충분하면 기존 fully-resident sharding을 기본값으로
 - `ramOffload=1`: CPU-backed GGUF + Qwen35 pager 활성
 - `gpuWeightGB`: pageable weight slot에 허용할 VRAM budget
 - `ramWindowLayers`: 한 번 page-in해서 같은 command buffer에서 실행할 layer 수
+- join 화면의 `give N GB`: paging 모드에서는 CPU weight backing-store budget
 
 현재 `gpuWeightGB`는 **전체 GPU 사용량이 아니라 pageable matrix slot budget**이다.
 LM head, KV cache, recurrent state, working buffer는 별도 resident이므로 8GB GPU에서
