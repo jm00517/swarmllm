@@ -9,6 +9,7 @@ import { gemmWGSL, GEMM_S, GEMM_TILE } from "./wgsl/gemm.js";
 import { coopWGSL, probeUnpack } from "./wgsl/coop.js";
 import { WGSL2 } from "./wgsl/qwen35.js";
 import { f16ToF32 } from "./gguf.js";
+import { WeightPager } from "./weight_pager.js";
 
 
 
@@ -32,8 +33,13 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, keepCpuWeights = false, pagedWeights = false, gpuWeightBudgetBytes = 0, gpuWeightReserveBytes = 0, pagedWindowLayers = 1 }) {
     this.device = device;
+    this.keepCpuWeights = !!keepCpuWeights;
+    this.pagedWeights = !!pagedWeights;
+    this.pagedWindowLayers = Math.max(1, Math.floor(pagedWindowLayers || 1));
+    if (this.pagedWeights && !(gpuWeightBudgetBytes > gpuWeightReserveBytes))
+      throw new Error("pagedWeights requires a positive GPU weight budget");
     this.mvVariant = matvecVariant;
     this.coopWG = coopWG; this.coopRows = coopRows;
     this.NC = batchCols; this.coopRowsB = coopRowsB;   // batched (prefill/verify) column count, rows per WG
@@ -172,6 +178,10 @@ export class Qwen35Engine {
 
     // ---- working buffers ----
     const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+    this.weightPager = this.pagedWeights ? new WeightPager(device, {
+      budgetBytes: gpuWeightBudgetBytes,
+      reserveBytes: gpuWeightReserveBytes,
+    }) : null;
     this.x = device.createBuffer({ size: dim * 4, usage: S });
     this.xn = device.createBuffer({ size: dim * 4, usage: S });
     this.tmpDim = device.createBuffer({ size: dim * 4, usage: S });
@@ -205,7 +215,9 @@ export class Qwen35Engine {
       if (e2.kind === "q8" || e2.kind === "q4")
         r = { kind: e2.kind, qs: this._buf(e2.qs, GPUBufferUsage.STORAGE), sc: this._buf(e2.scales, GPUBufferUsage.STORAGE) };
       else r = { kind: "f32", buf: this._buf(e2.data, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC) };
-      e2.qs = e2.scales = e2.data = null; // release CPU copy once it lives on the GPU
+      // Phase 1 RAM-offload mode keeps the packed CPU copy as the future pager's backing store.
+      // Resident mode preserves the old low-RAM behaviour and drops it after upload.
+      if (!this.keepCpuWeights) e2.qs = e2.scales = e2.data = null;
       return r;
     };
     const coop = this.mvVariant === "coop";
@@ -237,24 +249,33 @@ export class Qwen35Engine {
 
     this.layers = [];
     const buildLayer = (L) => {
-      const R = { isFull: L.isFull };
+      // In paged mode only small vectors/state are made resident here.
+      // Large projection matrices stay as packed CPU entries in R.cpu and are
+      // materialized into reusable WeightPager slots immediately before use.
+      const R = { isFull: L.isFull, cpu: this.pagedWeights ? L : null };
       R.attnNorm = up(L.attnNorm); R.postNorm = up(L.postNorm);
-      R.ffnGate = up(L.ffnGate); R.ffnUp = up(L.ffnUp); R.ffnDown = up(L.ffnDown);
       R.bgNorm1 = bgNorm(this.x, R.attnNorm, this.xn);
       R.bgNorm2 = bgNorm(this.x, R.postNorm, this.xn);
-      R.mvGate = mv(R.ffnGate, this.xn, this.g, inter, dim);
-      R.mvUp = mv(R.ffnUp, this.xn, this.u, inter, dim);
-      R.gu = guOp(R.ffnGate, R.ffnUp, this.xn, this.g, inter, dim);
-      R.mvDown = coop ? mv(R.ffnDown, this.g, this.x, dim, inter, true) : mv(R.ffnDown, this.g, this.tmpDim, dim, inter);
+
+      if (!this.pagedWeights) {
+        R.ffnGate = up(L.ffnGate); R.ffnUp = up(L.ffnUp); R.ffnDown = up(L.ffnDown);
+        R.mvGate = mv(R.ffnGate, this.xn, this.g, inter, dim);
+        R.mvUp = mv(R.ffnUp, this.xn, this.u, inter, dim);
+        R.gu = guOp(R.ffnGate, R.ffnUp, this.xn, this.g, inter, dim);
+        R.mvDown = coop ? mv(R.ffnDown, this.g, this.x, dim, inter, true) : mv(R.ffnDown, this.g, this.tmpDim, dim, inter);
+      }
+
       if (L.isFull) {
-        R.wq = up(L.wq); R.wk = up(L.wk); R.wv = up(L.wv); R.wo = up(L.wo);
         R.qNorm = up(L.qNorm); R.kNorm = up(L.kNorm);
         R.kCache = device.createBuffer({ size: maxSeq * kvDim * 4, usage: S });
         R.vCache = device.createBuffer({ size: maxSeq * kvDim * 4, usage: S });
-        R.mvQ = mv(R.wq, this.xn, this.qFull, nH * hd * 2, dim);
-        R.mvK = mv(R.wk, this.xn, this.k, kvDim, dim);
-        R.mvV = mv(R.wv, this.xn, this.v, kvDim, dim);
-        R.mvO = coop ? mv(R.wo, this.attnOut, this.x, dim, qDim, true) : mv(R.wo, this.attnOut, this.tmpDim, dim, qDim);
+        if (!this.pagedWeights) {
+          R.wq = up(L.wq); R.wk = up(L.wk); R.wv = up(L.wv); R.wo = up(L.wo);
+          R.mvQ = mv(R.wq, this.xn, this.qFull, nH * hd * 2, dim);
+          R.mvK = mv(R.wk, this.xn, this.k, kvDim, dim);
+          R.mvV = mv(R.wv, this.xn, this.v, kvDim, dim);
+          R.mvO = coop ? mv(R.wo, this.attnOut, this.x, dim, qDim, true) : mv(R.wo, this.attnOut, this.tmpDim, dim, qDim);
+        }
         R.bgQsplit = this._bg(this.pipes.qsplit, 1, [this.qFull, this.q, this.gAttn, this.dnBuf]);
         R.bgQNorm = this._bg(this.pipes.head_norm, 1, [this.q, R.qNorm.buf, this.uNH]);
         R.bgKNorm = this._bg(this.pipes.head_norm, 1, [this.k, R.kNorm.buf, this.uNKV]);
@@ -265,20 +286,22 @@ export class Qwen35Engine {
         R.bgAttnOut = this._bg(this.pipes.attn_out, 1, [this.scores, R.vCache, this.attnOut]);
         R.bgSigMul = this._bg(this.pipes.sigmoid_mul, 1, [this.attnOut, this.gAttn, this.uQDim]);
       } else {
-        R.wqkv = up(L.wqkv); R.wz = up(L.wz);
-        R.wBeta = up(L.wBeta); R.wAlpha = up(L.wAlpha);
-        R.wOut = up(L.wOut);
+        if (!this.pagedWeights) {
+          R.wqkv = up(L.wqkv); R.wz = up(L.wz);
+          R.wBeta = up(L.wBeta); R.wAlpha = up(L.wAlpha);
+          R.wOut = up(L.wOut);
+          R.mvQKV = mv(R.wqkv, this.xn, this.qkv, convDim, dim);
+          R.mvZ = mv(R.wz, this.xn, this.z, dInner, dim);
+          R.mvBeta = mv(R.wBeta, this.xn, this.betaRaw, nVH, dim);
+          R.mvAlpha = mv(R.wAlpha, this.xn, this.alpha, nVH, dim);
+          R.mvOut = coop ? mv(R.wOut, this.gated, this.x, dim, dInner, true) : mv(R.wOut, this.gated, this.tmpDim, dim, dInner);
+        }
         R.dtBias = this._buf(L.dtBias.data, GPUBufferUsage.STORAGE);
         R.ssmA = this._buf(L.ssmA.data, GPUBufferUsage.STORAGE);
         R.convW = this._buf(L.conv.data, GPUBufferUsage.STORAGE);
         R.ssmNorm = this._buf(L.ssmNorm.data, GPUBufferUsage.STORAGE);
         R.convState = device.createBuffer({ size: convDim * 3 * 4, usage: S });
         R.S = device.createBuffer({ size: nVH * dState * dState * 4, usage: S });
-        R.mvQKV = mv(R.wqkv, this.xn, this.qkv, convDim, dim);
-        R.mvZ = mv(R.wz, this.xn, this.z, dInner, dim);
-        R.mvBeta = mv(R.wBeta, this.xn, this.betaRaw, nVH, dim);
-        R.mvAlpha = mv(R.wAlpha, this.xn, this.alpha, nVH, dim);
-        R.mvOut = coop ? mv(R.wOut, this.gated, this.x, dim, dInner, true) : mv(R.wOut, this.gated, this.tmpDim, dim, dInner);
         R.bgConv = this._bg(this.pipes.dn_conv, 1, [this.qkv, R.convW, R.convState, this.convOut, this.dnBuf]);
         R.bgGates = this._bg(this.pipes.dn_gates, 1, [this.alpha, this.betaRaw, R.dtBias, R.ssmA, this.beta, this.decay, this.dnBuf]);
         R.bgPre = this._bg(this.pipes.dn_pre, 1, [this.alpha, this.betaRaw, R.dtBias, R.ssmA, this.beta, this.decay, this.convOut, this.dnBuf]);
@@ -303,7 +326,13 @@ export class Qwen35Engine {
     if (hasEmbed || hasHead) this.cpuEmbed = weights.embed;
     if (hasHead) {
       this.finalNorm = up(weights.finalNorm);
-      if (weights.head) this.headEntry = up(weights.head);
+      if (this.pagedWeights) {
+        // LM head도 layer weight와 같은 pager slot을 재사용한다. tied 모델은
+        // CPU embedding table 자체를 head backing store로 쓴다.
+        this.cpuHeadEntry = weights.head || weights.embed;
+        this.headEntry = null;
+        this.headOp = null;
+      } else if (weights.head) this.headEntry = up(weights.head);
       else { // tied: upload embed for the head but keep CPU copy for row lookups
         const e = weights.embed;
         this.headEntry = { kind: e.kind, qs: this._buf(e.qs, GPUBufferUsage.STORAGE), sc: this._buf(e.scales, GPUBufferUsage.STORAGE) };
@@ -315,7 +344,7 @@ export class Qwen35Engine {
       this.stageArg = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
       this.bgArgmax = this._bg(this.pipes.argmax, 1, [this.logits, this.argBuf, this._buf(new Uint32Array([vocab, 0, 0, 0]), GPUBufferUsage.UNIFORM)]);
       this.bgFinalNorm = bgNorm(this.x, this.finalNorm, this.xn);
-      this.headOp = mv(this.headEntry, this.xn, this.logits, vocab, dim);
+      if (!this.pagedWeights) this.headOp = mv(this.headEntry, this.xn, this.logits, vocab, dim);
     }
 
     this.bgCommonFor = {};
@@ -325,7 +354,7 @@ export class Qwen35Engine {
     this.bgAddTmp = this._bg(this.pipes.add_res, 1, [this.x, this.tmpDim]);
 
     // ---- multi-token prediction (draft) head ----
-    if (weights.mtp && hasHead) {
+    if (weights.mtp && hasHead && !this.pagedWeights) {
       const W = weights.mtp;
       this.mtpLayer = buildLayer(W.layer);
       this.mtp = {
@@ -341,6 +370,16 @@ export class Qwen35Engine {
         { buffer: M2.ehIn, offset: dim * 4, size: dim * 4 }, { buffer: this.uDim }]);
       M2.proj = mv(M2.ehProj, M2.ehIn, this.x, dim, 2 * dim);           // eh_proj -> MTP residual (in x)
       M2.bgHeadNorm = bgNorm(this.x, M2.headNorm, this.xn);               // shared_head_norm -> xn
+    }
+
+    // First working pager path is deliberately single-token only. Keeping the
+    // optimized batch/speculative methods visible would make room.js select them
+    // even though their bind groups still assume permanent weight residency.
+    if (this.pagedWeights) {
+      this.prefillTokens = null;
+      this.embedRunBatch = null;
+      this.runHiddenBatch = null;
+      this.specStep = null;
     }
   }
 
@@ -407,6 +446,91 @@ export class Qwen35Engine {
   }
   _setFrame(pos, seqLen) {
     this.device.queue.writeBuffer(this.frameBuf, 0, new Uint32Array([pos, seqLen]));
+  }
+
+  _pagedLayerEntries(L) {
+    const entries = [
+      ["ffnGate", L.ffnGate], ["ffnUp", L.ffnUp], ["ffnDown", L.ffnDown],
+    ];
+    if (L.isFull) entries.push(
+      ["fullQ", L.wq], ["fullK", L.wk], ["fullV", L.wv], ["fullO", L.wo],
+    );
+    else entries.push(
+      ["dnQKV", L.wqkv], ["dnZ", L.wz], ["dnBeta", L.wBeta],
+      ["dnAlpha", L.wAlpha], ["dnOut", L.wOut],
+    );
+    return entries;
+  }
+
+  _bindPagedLayer(i, W) {
+    const R = this.layers[i], L = R.cpu, D = this.dims, mv = this._mv;
+    const coop = this.mvVariant === "coop";
+    R.ffnGate = W.get("ffnGate"); R.ffnUp = W.get("ffnUp"); R.ffnDown = W.get("ffnDown");
+    R.mvGate = mv(R.ffnGate, this.xn, this.g, D.inter, D.dim);
+    R.mvUp = mv(R.ffnUp, this.xn, this.u, D.inter, D.dim);
+    R.gu = this._guOp(R.ffnGate, R.ffnUp, this.xn, this.g, D.inter, D.dim);
+    R.mvDown = coop ? mv(R.ffnDown, this.g, this.x, D.dim, D.inter, true) : mv(R.ffnDown, this.g, this.tmpDim, D.dim, D.inter);
+
+    if (L.isFull) {
+      R.wq = W.get("fullQ"); R.wk = W.get("fullK"); R.wv = W.get("fullV"); R.wo = W.get("fullO");
+      R.mvQ = mv(R.wq, this.xn, this.qFull, D.nH * D.hd * 2, D.dim);
+      R.mvK = mv(R.wk, this.xn, this.k, D.kvDim, D.dim);
+      R.mvV = mv(R.wv, this.xn, this.v, D.kvDim, D.dim);
+      R.mvO = coop ? mv(R.wo, this.attnOut, this.x, D.dim, D.qDim, true) : mv(R.wo, this.attnOut, this.tmpDim, D.dim, D.qDim);
+    } else {
+      R.wqkv = W.get("dnQKV"); R.wz = W.get("dnZ");
+      R.wBeta = W.get("dnBeta"); R.wAlpha = W.get("dnAlpha"); R.wOut = W.get("dnOut");
+      R.mvQKV = mv(R.wqkv, this.xn, this.qkv, D.convDim, D.dim);
+      R.mvZ = mv(R.wz, this.xn, this.z, D.dInner, D.dim);
+      R.mvBeta = mv(R.wBeta, this.xn, this.betaRaw, D.nVH, D.dim);
+      R.mvAlpha = mv(R.wAlpha, this.xn, this.alpha, D.nVH, D.dim);
+      R.mvOut = coop ? mv(R.wOut, this.gated, this.x, D.dim, D.dInner, true) : mv(R.wOut, this.gated, this.tmpDim, D.dim, D.dInner);
+    }
+  }
+
+  async _preparePagedWindow(lo, hi) {
+    if (!this.pagedWeights) return;
+    const items = [];
+    const specs = [];
+    for (let i = lo; i < hi; i++) {
+      const slot = i - lo;
+      const aliases = new Map();
+      const entries = this._pagedLayerEntries(this.layers[i].cpu);
+      for (let j = 0; j < entries.length; j++) {
+        const [alias, entry] = entries[j];
+        const key = `s${slot}:w${j}`;
+        items.push([key, entry]);
+        aliases.set(alias, key);
+      }
+      specs.push({ i, aliases });
+    }
+
+    const gpu = await this.weightPager.materializeMany(items);
+    for (const { i, aliases } of specs) {
+      const W = new Map();
+      for (const [alias, key] of aliases) W.set(alias, gpu.get(key));
+      this._bindPagedLayer(i, W);
+    }
+  }
+
+  async _runPagedLayers() {
+    const W = this.pagedWindowLayers;
+    for (let lo = 0; lo < this.layers.length; lo += W) {
+      const hi = Math.min(this.layers.length, lo + W);
+      await this._preparePagedWindow(lo, hi);
+      const enc = this.device.createCommandEncoder();
+      for (let i = lo; i < hi; i++) this._encodeLayer(enc, i);
+      this.device.queue.submit([enc.finish()]);
+    }
+    await this.device.queue.onSubmittedWorkDone();
+  }
+
+  async _preparePagedHead() {
+    if (!this.pagedWeights || !this.hasHead) return;
+    // s0:w0은 다음 token의 첫 window가 다시 덮어쓴다. 별도 head slot을
+    // 만들지 않아 page budget 바깥으로 VRAM이 늘어나는 걸 막는다.
+    this.headEntry = await this.weightPager.materialize("s0:w0", this.cpuHeadEntry);
+    this.headOp = this._mv(this.headEntry, this.xn, this.logits, this.dims.vocab, this.dims.dim);
   }
 
   _encodeLayer(enc, i) { this._encodeLayerR(enc, this.layers[i], this.pos); }
@@ -1001,6 +1125,11 @@ export class Qwen35Engine {
   async prefillToken(tokenId) {
     this._setFrame(this.pos, this.pos + 1);
     this.device.queue.writeBuffer(this.x, 0, this._embedRowF32(tokenId));
+    if (this.pagedWeights) {
+      await this._runPagedLayers();
+      this.pos++;
+      return;
+    }
     const enc = this.device.createCommandEncoder();
     for (let i = 0; i < this.layers.length; i++) this._encodeLayer(enc, i);
     this.device.queue.submit([enc.finish()]);
@@ -1013,9 +1142,12 @@ export class Qwen35Engine {
     this.pos = pos;
     this._setFrame(pos, pos + 1);
     this.device.queue.writeBuffer(this.x, 0, this._embedRowF32(tokenId));
-    const enc = this.device.createCommandEncoder();
-    for (let i = 0; i < this.layers.length; i++) this._encodeLayer(enc, i);
-    this.device.queue.submit([enc.finish()]);
+    if (this.pagedWeights) await this._runPagedLayers();
+    else {
+      const enc = this.device.createCommandEncoder();
+      for (let i = 0; i < this.layers.length; i++) this._encodeLayer(enc, i);
+      this.device.queue.submit([enc.finish()]);
+    }
     return await this._readback(this.x, this.stageX, dim);
   }
 
@@ -1024,15 +1156,19 @@ export class Qwen35Engine {
     this.pos = pos;
     this._setFrame(pos, pos + 1);
     this.device.queue.writeBuffer(this.x, 0, xIn);
-    const enc = this.device.createCommandEncoder();
-    for (let i = 0; i < this.layers.length; i++) this._encodeLayer(enc, i);
-    this.device.queue.submit([enc.finish()]);
+    if (this.pagedWeights) await this._runPagedLayers();
+    else {
+      const enc = this.device.createCommandEncoder();
+      for (let i = 0; i < this.layers.length; i++) this._encodeLayer(enc, i);
+      this.device.queue.submit([enc.finish()]);
+    }
     return await this._readback(this.x, this.stageX, dim);
   }
 
   async headFromHidden(xIn) {
     const { vocab } = this.dims;
-    this.device.queue.writeBuffer(this.x, 0, xIn);
+    if (xIn) this.device.queue.writeBuffer(this.x, 0, xIn);
+    if (this.pagedWeights) await this._preparePagedHead();
     const enc = this.device.createCommandEncoder();
     {
       const p = enc.beginComputePass();
@@ -1050,6 +1186,12 @@ export class Qwen35Engine {
     const { vocab } = this.dims;
     this._setFrame(this.pos, this.pos + 1);
     this.device.queue.writeBuffer(this.x, 0, this._embedRowF32(tokenId));
+    if (this.pagedWeights) {
+      await this._runPagedLayers();
+      const logits = await this.headFromHidden(null);
+      this.pos++;
+      return logits;
+    }
     const enc = this.device.createCommandEncoder();
     for (let i = 0; i < this.layers.length; i++) this._encodeLayer(enc, i);
     {

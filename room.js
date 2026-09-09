@@ -126,6 +126,16 @@ function log(from, text) {
   $("chat-log").scrollTop = $("chat-log").scrollHeight;
 }
 
+function memoryLabel(meta) {
+  if (meta?.ramOffload) {
+    const cpu = meta.cpuWeightGB ?? meta.contribGB ?? 0;
+    const gpu = meta.gpuWeightGB ?? 0;
+    return `RAM ${cpu} GB · GPU page ${gpu} GB`;
+  }
+  const budget = meta?.budgetGB || meta?.maxBufGB;
+  return meta?.contribGB ? "gives " + meta.contribGB + " GB" : (budget ? budget + " GB" : "—");
+}
+
 function peerCard(id, name, meta, self) {
   const card = document.createElement("div");
   card.className = "peer-card" + (self ? " self" : "");
@@ -141,8 +151,7 @@ function peerCard(id, name, meta, self) {
   card.querySelector(".pname").textContent = name + (self ? " (you)" : "");
   card.querySelector(".peer-gpu").textContent = meta.webgpu
     ? `${meta.ua} · ${meta.gpu}` : `${meta.ua} · ⚠ no WebGPU`;
-  const budget = meta.budgetGB || meta.maxBufGB;
-  card.querySelector(".buf").textContent = meta.contribGB ? "gives " + meta.contribGB + " GB" : (budget ? budget + " GB" : "—");
+  card.querySelector(".buf").textContent = memoryLabel(meta);
   $("peers").appendChild(card);
   if (!self) card.querySelector(".bw-btn").addEventListener("click", () => bwTest(id));
   return card;
@@ -189,11 +198,25 @@ function enterRoom() {
   if (selfCard && myMeta.webgpu) {
     const row = document.createElement("div");
     row.className = "pledge";
-    row.innerHTML = `give <input type="number" min="1" max="64" step="1" value="${myMeta.contribGB}"> GB of GPU`;
+    row.innerHTML = RAM_OFFLOAD
+      ? `give <input type="number" min="1" max="64" step="1" value="${myMeta.contribGB}"> GB of RAM weights`
+      : `give <input type="number" min="1" max="64" step="1" value="${myMeta.contribGB}"> GB of GPU`;
     selfCard.appendChild(row);
     row.querySelector("input").addEventListener("change", (e) => {
       const v = parseFloat(e.target.value);
-      if (v >= (myMeta.phone ? 0.5 : 1)) { myMeta.contribGB = v; selfCard.querySelector(".buf").textContent = "gives " + v + " GB"; updateCluster(); broadcastAll({ t: "pledge", gb: v }); }
+      if (v >= (myMeta.phone ? 0.5 : 1)) {
+        myMeta.contribGB = v;
+        if (myMeta.ramOffload) myMeta.cpuWeightGB = v;
+        selfCard.querySelector(".buf").textContent = memoryLabel(myMeta);
+        updateCluster();
+        broadcastAll({
+          t: "pledge", gb: v,
+          ramOffload: !!myMeta.ramOffload,
+          cpuWeightGB: myMeta.cpuWeightGB,
+          gpuWeightGB: myMeta.gpuWeightGB,
+          ramWindowLayers: myMeta.ramWindowLayers,
+        });
+      }
     });
   }
 }
@@ -307,7 +330,7 @@ function onData(from, d) {
         seen.add(m.id);
         members.set(m.id, { name: m.name, meta: m.meta });
         const c = ensureCard(m.id, m.name, m.meta);
-        if (m.meta?.contribGB) c.querySelector(".buf").textContent = "gives " + m.meta.contribGB + " GB";
+        c.querySelector(".buf").textContent = memoryLabel(m.meta);
         const ce = conns.get(m.id); if (ce) ce.meta = m.meta;
       }
       for (const id of [...members.keys()]) if (!seen.has(id)) { members.delete(id); dropCard(id); }
@@ -320,12 +343,22 @@ function onData(from, d) {
       if (e.card) e.card.querySelector(".rtt").textContent = e.rtt + " ms";
       break;
     }
-    case "pledge":
-      if (e) { e.meta = { ...e.meta, contribGB: d.gb }; if (e.card) e.card.querySelector(".buf").textContent = "gives " + d.gb + " GB"; }
-      if (members.has(from)) members.get(from).meta = { ...members.get(from).meta, contribGB: d.gb };
-      if (isHost && roster.has(from)) { roster.get(from).meta = { ...roster.get(from).meta, contribGB: d.gb }; broadcastRoster(); }
+    case "pledge": {
+      const patch = {
+        contribGB: d.gb,
+        ...(d.ramOffload ? {
+          ramOffload: true,
+          cpuWeightGB: d.cpuWeightGB ?? d.gb,
+          gpuWeightGB: d.gpuWeightGB,
+          ramWindowLayers: d.ramWindowLayers,
+        } : {}),
+      };
+      if (e) { e.meta = { ...e.meta, ...patch }; if (e.card) e.card.querySelector(".buf").textContent = memoryLabel(e.meta); }
+      if (members.has(from)) members.get(from).meta = { ...members.get(from).meta, ...patch };
+      if (isHost && roster.has(from)) { roster.get(from).meta = { ...roster.get(from).meta, ...patch }; broadcastRoster(); }
       updateCluster();
       break;
+    }
     case "bw-start": bwRecv.set(from, { bytes: 0, t0: performance.now() }); break;
     case "bw-end": {
       const st = bwRecv.get(from);
@@ -390,6 +423,10 @@ async function start(create) {
   myMeta = await metaPromise;
   const gbIn = parseFloat($("join-gb").value);
   myMeta.contribGB = Math.max(myMeta.phone ? 0.5 : 1, gbIn > 0 ? gbIn : (myMeta.contribGB || 1));
+  myMeta.ramOffload = RAM_OFFLOAD;
+  myMeta.cpuWeightGB = RAM_OFFLOAD ? myMeta.contribGB : 0;
+  myMeta.gpuWeightGB = RAM_OFFLOAD ? RAM_GPU_WEIGHT_GB : myMeta.contribGB;
+  myMeta.ramWindowLayers = RAM_OFFLOAD ? RAM_WINDOW_LAYERS : 0;
 
   // STUN for hole-punching; TURN as fallback for symmetric NAT / CGNAT peers.
   // ICE prefers direct candidates, so TURN only carries traffic when a direct
@@ -561,6 +598,15 @@ const rangeBytesOf = (url) => async (info) => {
   return bytes;
 };
 
+// RAM weight paging 실험 스위치.
+// ?ramOffload=1&gpuWeightGB=2 처럼 켠다. gpuWeightGB는 pageable matrix slot에
+// 허용할 VRAM budget이며 head/KV/state/working buffer는 별도 resident다.
+const RAM_PARAMS = new URLSearchParams(location.search);
+const RAM_OFFLOAD = RAM_PARAMS.get("ramOffload") === "1";
+const RAM_GPU_WEIGHT_GB = Math.max(0.25, Number(RAM_PARAMS.get("gpuWeightGB")) || 2);
+const RAM_GPU_WEIGHT_BYTES = Math.floor(RAM_GPU_WEIGHT_GB * 2 ** 30);
+const RAM_WINDOW_LAYERS = Math.max(1, Math.floor(Number(RAM_PARAMS.get("ramWindowLayers")) || 1));
+
 let ai = {
   engine: null, tok: null, cfg: null, device: null,
   role: null,            // "host" | "worker"
@@ -720,11 +766,15 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
     if (hasEmbed || hasHead) ai.tok = makeTokenizer(tokenizerFromGGUF(G.meta));
     // the host also loads the model's multi-token-prediction block: it drafts
     // tokens that the trunk then verifies in one batched pass (same output, faster)
-    const opts = { lo: range[0], hi: range[1], hasEmbed, hasHead, mtp: hasHead };
+    const opts = { lo: range[0], hi: range[1], hasEmbed, hasHead, mtp: hasHead && !RAM_OFFLOAD };
     const total = qwen35ShardBytes(G, opts);
-    G.streamEntry = streamWithRetry(M.gguf, streamOpts);
+    // RAM paging mode keeps packed Q4/Q8 arrays in system memory and skips the
+    // direct-to-final-GPU streaming path. Qwen35Engine pages one layer at a time.
+    G.streamEntry = RAM_OFFLOAD ? null : streamWithRetry(M.gguf, streamOpts);
+    if (RAM_OFFLOAD) aiStatus(`RAM weight cache 준비 중… · GPU page budget ${RAM_GPU_WEIGHT_GB.toFixed(2)} GB`);
     const weights = await qwen35Weights(G, rangeBytesOf(M.gguf), opts, (done) => onProg(done, total),
-      (e, name) => gpuUploadEntry(ai.device, e, name === GGML_EMBED));   // straight to the GPU, RAM stays flat
+      RAM_OFFLOAD ? null : (e, name) => gpuUploadEntry(ai.device, e, name === GGML_EMBED),
+      { cpuBacked: RAM_OFFLOAD });
     aiStatus("building GPU pipelines (compiling shaders)\u2026");
     ai.engine = await Qwen35Engine.create({
       device: ai.device, meta: G.meta, weights, vocab: G.tensors[GGML_EMBED]?.shape?.[0],
@@ -735,7 +785,16 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
       // columns and drop to the 8- or 4-column GEMV twins automatically, so
       // the generated stream is unchanged.
       batchCols: 16, coopRowsB: 1,
+      keepCpuWeights: RAM_OFFLOAD,
+      pagedWeights: RAM_OFFLOAD,
+      gpuWeightBudgetBytes: RAM_GPU_WEIGHT_BYTES,
+      pagedWindowLayers: RAM_WINDOW_LAYERS,
     });
+    if (RAM_OFFLOAD) {
+      const ps = ai.engine.weightPager?.snapshot?.();
+      log("swarm", `RAM weight paging 활성 · page budget ${RAM_GPU_WEIGHT_GB.toFixed(2)} GB · window ${RAM_WINDOW_LAYERS} layer` +
+        (ps ? ` · allocated ${(ps.allocatedBytes / 2 ** 20).toFixed(0)} MiB at init` : ""));
+    }
   } else if (M.kind === "gguf") {
     aiStatus("reading model index\u2026");
     const G = ai.G && ai.GModel === modelKey ? ai.G : await fetchGGUFHeader(M.gguf, false);   // vocab comes from tokenizer.json
@@ -767,8 +826,11 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
 }
 
 // ---- host ----
+function weightCapacityGB(m) {
+  return m?.ramOffload ? (m.cpuWeightGB ?? m.contribGB ?? 0) : (m?.contribGB ?? 0);
+}
 function biggestPeerId() {
-  const gb = (m) => m?.contribGB ?? 0;
+  const gb = weightCapacityGB;
   let best = peer.id, bestGB = gb(myMeta);
   for (const [id, e] of conns) if (gb(e.meta) > bestGB || (gb(e.meta) === bestGB && id < best)) { best = id; bestGB = gb(e.meta); }
   return best;
@@ -805,7 +867,8 @@ async function aiStart(modelArg) {
       ai.GModel = modelKey;
       L = ai.G.meta["qwen35.block_count"] - (ai.G.meta["qwen35.nextn_predict_layers"] || 0);
       layerBytes = qwen35ShardBytes(ai.G, { lo: 0, hi: 4, hasEmbed: false, hasHead: false }) / 4;
-      embedBytes = (ai.G.tensors[GGML_EMBED]?.byteLength || 0) + (ai.G.tensors[GGML_OUTPUT]?.byteLength || 0) + qwen35MtpBytes(ai.G);
+      embedBytes = (ai.G.tensors[GGML_EMBED]?.byteLength || 0) + (ai.G.tensors[GGML_OUTPUT]?.byteLength || 0)
+        + (RAM_OFFLOAD ? 0 : qwen35MtpBytes(ai.G));
     } else {
       cfg = await (await fetch(M.cfg)).json();
       L = cfg.num_hidden_layers;
@@ -825,7 +888,7 @@ async function aiStart(modelArg) {
       layerBytes = (2 * d * d + 2 * kvDim * d + 3 * cfg.intermediate_size * d) * 4;
       embedBytes = cfg.vocab_size * d * 4;
     }
-    const pledgeOf = (m) => ((m?.contribGB ?? (m?.maxBufGB ? m.maxBufGB * 0.5 : 0.5))) * 2 ** 30;
+    const pledgeOf = (m) => ((weightCapacityGB(m) || (m?.maxBufGB ? m.maxBufGB * 0.5 : 0.5))) * 2 ** 30;
     const parts = [
       { cap: Math.max(pledgeOf(myMeta) - embedBytes, layerBytes / 2) },
       ...ai.chain.map((id) => ({ cap: Math.max(pledgeOf(conns.get(id)?.meta), layerBytes / 2) })),
@@ -955,6 +1018,7 @@ async function aiGenerate(textArg, who) {
   const asker = who || myName;
   if (!text || ai.busy === "gen" || !ai.engine) return;
   try { ai.engine.reset?.(); } catch {}
+  const pagerStart = ai.engine.weightPager?.snapshot?.() || null;
   ai.pos = 0;
   broadcastAll({ t: "ai-reset" });
   ai.busy = "gen";
@@ -1116,7 +1180,12 @@ async function aiGenerate(textArg, who) {
       }
     }
     const secs = (performance.now() - t0) / 1000;
-    const stats = `${count} tok · ${(count / secs).toFixed(1)} tok/s · ${ai.chain.length + 1} devices${capped ? ` · stopped: context full (${MAX_SEQ} tokens)` : ""}`;
+    const pagerEnd = ai.engine.weightPager?.snapshot?.() || null;
+    const paging = pagerEnd && pagerStart
+      ? ` · paged ${((pagerEnd.bytesMoved - pagerStart.bytesMoved) / 2 ** 30).toFixed(2)} GB` +
+        ` / ${((pagerEnd.uploadMs - pagerStart.uploadMs) / 1000).toFixed(1)}s upload`
+      : "";
+    const stats = `${count} tok · ${(count / secs).toFixed(1)} tok/s · ${ai.chain.length + 1} devices${paging}${capped ? ` · stopped: context full (${MAX_SEQ} tokens)` : ""}`;
     chatBotEnd(reply, stats);
     broadcastAll({ t: "ai-gendone", stats });
     mascot("Done. Anyone in the room can ask the next one.");
