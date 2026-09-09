@@ -561,9 +561,13 @@ const rangeBytesOf = (url) => async (info) => {
   return bytes;
 };
 
-// Phase 1 실험 스위치. ?ramOffload=1 로 켜면 Qwen3.5/3.8 weight의
-// packed CPU copy를 유지한다. 아직 pager 전 단계라 GPU에도 전체 shard가 상주한다.
-const RAM_OFFLOAD_PHASE1 = new URLSearchParams(location.search).get("ramOffload") === "1";
+// RAM weight paging 실험 스위치.
+// ?ramOffload=1&gpuWeightGB=2 처럼 켠다. gpuWeightGB는 pageable matrix slot에
+// 허용할 VRAM budget이며 head/KV/state/working buffer는 별도 resident다.
+const RAM_PARAMS = new URLSearchParams(location.search);
+const RAM_OFFLOAD = RAM_PARAMS.get("ramOffload") === "1";
+const RAM_GPU_WEIGHT_GB = Math.max(0.25, Number(RAM_PARAMS.get("gpuWeightGB")) || 2);
+const RAM_GPU_WEIGHT_BYTES = Math.floor(RAM_GPU_WEIGHT_GB * 2 ** 30);
 
 let ai = {
   engine: null, tok: null, cfg: null, device: null,
@@ -724,15 +728,15 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
     if (hasEmbed || hasHead) ai.tok = makeTokenizer(tokenizerFromGGUF(G.meta));
     // the host also loads the model's multi-token-prediction block: it drafts
     // tokens that the trunk then verifies in one batched pass (same output, faster)
-    const opts = { lo: range[0], hi: range[1], hasEmbed, hasHead, mtp: hasHead };
+    const opts = { lo: range[0], hi: range[1], hasEmbed, hasHead, mtp: hasHead && !RAM_OFFLOAD };
     const total = qwen35ShardBytes(G, opts);
-    // CPU-backed mode intentionally bypasses direct-to-GPU streaming so packed Q4/Q8
-    // arrays survive in JS memory. Phase 2 will hand these arrays to WeightPager.
-    G.streamEntry = RAM_OFFLOAD_PHASE1 ? null : streamWithRetry(M.gguf, streamOpts);
-    if (RAM_OFFLOAD_PHASE1) aiStatus("RAM backing store 준비 중… (Phase 1)");
+    // RAM paging mode keeps packed Q4/Q8 arrays in system memory and skips the
+    // direct-to-final-GPU streaming path. Qwen35Engine pages one layer at a time.
+    G.streamEntry = RAM_OFFLOAD ? null : streamWithRetry(M.gguf, streamOpts);
+    if (RAM_OFFLOAD) aiStatus(`RAM weight cache 준비 중… · GPU page budget ${RAM_GPU_WEIGHT_GB.toFixed(2)} GB`);
     const weights = await qwen35Weights(G, rangeBytesOf(M.gguf), opts, (done) => onProg(done, total),
-      RAM_OFFLOAD_PHASE1 ? null : (e, name) => gpuUploadEntry(ai.device, e, name === GGML_EMBED),
-      { cpuBacked: RAM_OFFLOAD_PHASE1 });
+      RAM_OFFLOAD ? null : (e, name) => gpuUploadEntry(ai.device, e, name === GGML_EMBED),
+      { cpuBacked: RAM_OFFLOAD });
     aiStatus("building GPU pipelines (compiling shaders)\u2026");
     ai.engine = await Qwen35Engine.create({
       device: ai.device, meta: G.meta, weights, vocab: G.tensors[GGML_EMBED]?.shape?.[0],
@@ -743,10 +747,15 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
       // columns and drop to the 8- or 4-column GEMV twins automatically, so
       // the generated stream is unchanged.
       batchCols: 16, coopRowsB: 1,
-      keepCpuWeights: RAM_OFFLOAD_PHASE1,
+      keepCpuWeights: RAM_OFFLOAD,
+      pagedWeights: RAM_OFFLOAD,
+      gpuWeightBudgetBytes: RAM_GPU_WEIGHT_BYTES,
     });
-    if (RAM_OFFLOAD_PHASE1)
-      log("swarm", "RAM offload Phase 1: packed CPU weight 유지 완료 · 현재는 GPU에도 전체 shard가 상주");
+    if (RAM_OFFLOAD) {
+      const ps = ai.engine.weightPager?.snapshot?.();
+      log("swarm", `RAM weight paging 활성 · page budget ${RAM_GPU_WEIGHT_GB.toFixed(2)} GB` +
+        (ps ? ` · allocated ${(ps.allocatedBytes / 2 ** 20).toFixed(0)} MiB at init` : ""));
+    }
   } else if (M.kind === "gguf") {
     aiStatus("reading model index\u2026");
     const G = ai.G && ai.GModel === modelKey ? ai.G : await fetchGGUFHeader(M.gguf, false);   // vocab comes from tokenizer.json
