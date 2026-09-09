@@ -33,10 +33,11 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, keepCpuWeights = false, pagedWeights = false, gpuWeightBudgetBytes = 0, gpuWeightReserveBytes = 0 }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, keepCpuWeights = false, pagedWeights = false, gpuWeightBudgetBytes = 0, gpuWeightReserveBytes = 0, pagedWindowLayers = 1 }) {
     this.device = device;
     this.keepCpuWeights = !!keepCpuWeights;
     this.pagedWeights = !!pagedWeights;
+    this.pagedWindowLayers = Math.max(1, Math.floor(pagedWindowLayers || 1));
     if (this.pagedWeights && !(gpuWeightBudgetBytes > gpuWeightReserveBytes))
       throw new Error("pagedWeights requires a positive GPU weight budget");
     this.mvVariant = matvecVariant;
@@ -441,21 +442,22 @@ export class Qwen35Engine {
     this.device.queue.writeBuffer(this.frameBuf, 0, new Uint32Array([pos, seqLen]));
   }
 
-  async _preparePagedLayer(i) {
-    if (!this.pagedWeights) return;
-    const R = this.layers[i], L = R.cpu, D = this.dims, mv = this._mv;
-    const items = [
+  _pagedLayerEntries(L) {
+    const entries = [
       ["ffnGate", L.ffnGate], ["ffnUp", L.ffnUp], ["ffnDown", L.ffnDown],
     ];
-    if (L.isFull) items.push(
+    if (L.isFull) entries.push(
       ["fullQ", L.wq], ["fullK", L.wk], ["fullV", L.wv], ["fullO", L.wo],
     );
-    else items.push(
+    else entries.push(
       ["dnQKV", L.wqkv], ["dnZ", L.wz], ["dnBeta", L.wBeta],
       ["dnAlpha", L.wAlpha], ["dnOut", L.wOut],
     );
+    return entries;
+  }
 
-    const W = await this.weightPager.materializeMany(items);
+  _bindPagedLayer(i, W) {
+    const R = this.layers[i], L = R.cpu, D = this.dims, mv = this._mv;
     const coop = this.mvVariant === "coop";
     R.ffnGate = W.get("ffnGate"); R.ffnUp = W.get("ffnUp"); R.ffnDown = W.get("ffnDown");
     R.mvGate = mv(R.ffnGate, this.xn, this.g, D.inter, D.dim);
@@ -480,11 +482,38 @@ export class Qwen35Engine {
     }
   }
 
+  async _preparePagedWindow(lo, hi) {
+    if (!this.pagedWeights) return;
+    const items = [];
+    const specs = [];
+    for (let i = lo; i < hi; i++) {
+      const slot = i - lo;
+      const aliases = new Map();
+      const entries = this._pagedLayerEntries(this.layers[i].cpu);
+      for (let j = 0; j < entries.length; j++) {
+        const [alias, entry] = entries[j];
+        const key = `s${slot}:w${j}`;
+        items.push([key, entry]);
+        aliases.set(alias, key);
+      }
+      specs.push({ i, aliases });
+    }
+
+    const gpu = await this.weightPager.materializeMany(items);
+    for (const { i, aliases } of specs) {
+      const W = new Map();
+      for (const [alias, key] of aliases) W.set(alias, gpu.get(key));
+      this._bindPagedLayer(i, W);
+    }
+  }
+
   async _runPagedLayers() {
-    for (let i = 0; i < this.layers.length; i++) {
-      await this._preparePagedLayer(i);
+    const W = this.pagedWindowLayers;
+    for (let lo = 0; lo < this.layers.length; lo += W) {
+      const hi = Math.min(this.layers.length, lo + W);
+      await this._preparePagedWindow(lo, hi);
       const enc = this.device.createCommandEncoder();
-      this._encodeLayer(enc, i);
+      for (let i = lo; i < hi; i++) this._encodeLayer(enc, i);
       this.device.queue.submit([enc.finish()]);
     }
     await this.device.queue.onSubmittedWorkDone();
