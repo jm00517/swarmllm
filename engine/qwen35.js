@@ -32,8 +32,9 @@ export class Qwen35Engine {
   }
 
   // opts: { device, meta (gguf meta), weights, layerRange, hasEmbed, hasHead, maxSeq }
-  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true }) {
+  async _init({ device, meta, weights, layerRange, hasEmbed = true, hasHead = true, maxSeq = 512, vocab: vocabOpt, matvecVariant = "coop", coopWG = 256, coopRows = 4, batchCols = 4, coopRowsB = coopRows, gemm = true, keepCpuWeights = false }) {
     this.device = device;
+    this.keepCpuWeights = !!keepCpuWeights;
     this.mvVariant = matvecVariant;
     this.coopWG = coopWG; this.coopRows = coopRows;
     this.NC = batchCols; this.coopRowsB = coopRowsB;   // batched (prefill/verify) column count, rows per WG
@@ -205,7 +206,9 @@ export class Qwen35Engine {
       if (e2.kind === "q8" || e2.kind === "q4")
         r = { kind: e2.kind, qs: this._buf(e2.qs, GPUBufferUsage.STORAGE), sc: this._buf(e2.scales, GPUBufferUsage.STORAGE) };
       else r = { kind: "f32", buf: this._buf(e2.data, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC) };
-      e2.qs = e2.scales = e2.data = null; // release CPU copy once it lives on the GPU
+      // Phase 1 RAM-offload mode keeps the packed CPU copy as the future pager's backing store.
+      // Resident mode preserves the old low-RAM behaviour and drops it after upload.
+      if (!this.keepCpuWeights) e2.qs = e2.scales = e2.data = null;
       return r;
     };
     const coop = this.mvVariant === "coop";
