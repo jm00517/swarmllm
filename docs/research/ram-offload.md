@@ -83,17 +83,20 @@ pageable 대상으로 둘 것:
 
 ### Phase 1 — CPU packed weight 유지
 
-수정 대상:
+완료.
 
-- `engine/gguf.js`
-- `room.js`
+- `ggufEntry(..., { cpuBacked: true })` 경로 추가
+- CPU-backed 모드에서는 direct-to-GPU streaming 우회
+- Q4/Q8 packed typed array를 RAM에 유지
+- `Qwen35Engine`에 `keepCpuWeights` 옵션 추가
+- 기존 fully-resident 경로는 그대로 유지
+- unit test 추가
 
-paged 모드에서는 Q4/Q8을 RAM의 typed array로 유지하고
-`streamEntryToGPU()` / `gpuUploadEntry()`를 우회한다.
+현재 테스트 스위치는 URL에 `?ramOffload=1`을 붙여 켠다.
 
-기존 fully-resident 경로는 그대로 유지한다.
-
-예상 변경량: 약 100~180 LOC.
+중요: 이 단계에서는 **RAM copy를 유지하면서 GPU에도 전체 shard가 상주한다.**
+즉 아직 VRAM 절약은 없다. 다음 Phase 2/3에서 `WeightPager`와 reusable GPU slot을
+붙여 실제 page-in/page-out으로 바꾼다.
 
 ### Phase 2 — WeightPager
 
