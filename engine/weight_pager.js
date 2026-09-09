@@ -136,6 +136,11 @@ export class WeightPager {
   async materializeMany(items) {
     const out = new Map();
     const dirty = [];
+
+    // Slots are reused across layers. Wait for the previous layer's submitted
+    // work before a slot can be resized or overwritten. Later we can replace
+    // this conservative barrier with double-buffered prefetch.
+    if (this.slots.size) await this.device.queue.onSubmittedWorkDone?.();
     const t0 = performance.now();
 
     for (const [key, e] of items) {
