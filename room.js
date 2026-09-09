@@ -561,6 +561,10 @@ const rangeBytesOf = (url) => async (info) => {
   return bytes;
 };
 
+// Phase 1 실험 스위치. ?ramOffload=1 로 켜면 Qwen3.5/3.8 weight의
+// packed CPU copy를 유지한다. 아직 pager 전 단계라 GPU에도 전체 shard가 상주한다.
+const RAM_OFFLOAD_PHASE1 = new URLSearchParams(location.search).get("ramOffload") === "1";
+
 let ai = {
   engine: null, tok: null, cfg: null, device: null,
   role: null,            // "host" | "worker"
@@ -722,9 +726,13 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
     // tokens that the trunk then verifies in one batched pass (same output, faster)
     const opts = { lo: range[0], hi: range[1], hasEmbed, hasHead, mtp: hasHead };
     const total = qwen35ShardBytes(G, opts);
-    G.streamEntry = streamWithRetry(M.gguf, streamOpts);
+    // CPU-backed mode intentionally bypasses direct-to-GPU streaming so packed Q4/Q8
+    // arrays survive in JS memory. Phase 2 will hand these arrays to WeightPager.
+    G.streamEntry = RAM_OFFLOAD_PHASE1 ? null : streamWithRetry(M.gguf, streamOpts);
+    if (RAM_OFFLOAD_PHASE1) aiStatus("RAM backing store 준비 중… (Phase 1)");
     const weights = await qwen35Weights(G, rangeBytesOf(M.gguf), opts, (done) => onProg(done, total),
-      (e, name) => gpuUploadEntry(ai.device, e, name === GGML_EMBED));   // straight to the GPU, RAM stays flat
+      RAM_OFFLOAD_PHASE1 ? null : (e, name) => gpuUploadEntry(ai.device, e, name === GGML_EMBED),
+      { cpuBacked: RAM_OFFLOAD_PHASE1 });
     aiStatus("building GPU pipelines (compiling shaders)\u2026");
     ai.engine = await Qwen35Engine.create({
       device: ai.device, meta: G.meta, weights, vocab: G.tensors[GGML_EMBED]?.shape?.[0],
@@ -735,7 +743,10 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
       // columns and drop to the 8- or 4-column GEMV twins automatically, so
       // the generated stream is unchanged.
       batchCols: 16, coopRowsB: 1,
+      keepCpuWeights: RAM_OFFLOAD_PHASE1,
     });
+    if (RAM_OFFLOAD_PHASE1)
+      log("swarm", "RAM offload Phase 1: packed CPU weight 유지 완료 · 현재는 GPU에도 전체 shard가 상주");
   } else if (M.kind === "gguf") {
     aiStatus("reading model index\u2026");
     const G = ai.G && ai.GModel === modelKey ? ai.G : await fetchGGUFHeader(M.gguf, false);   // vocab comes from tokenizer.json
