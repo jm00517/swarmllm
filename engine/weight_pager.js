@@ -124,36 +124,54 @@ export class WeightPager {
     }
   }
 
-  // Copy one CPU-backed packed entry into a reusable named slot.
-  // Repeating the same entry in the same slot is a no-op.
-  async materialize(key, e) {
-    if (!e) throw new Error("cannot materialize empty weight");
-    const s = this._ensureSlot(key, e);
-    if (s.entry === e) {
-      this.stats.cacheHits++;
-      return e.kind === "f32"
-        ? { kind: "f32", buf: s.buf }
-        : { kind: e.kind, qs: s.qs, sc: s.sc };
-    }
-
-    const t0 = performance.now();
-    if (e.kind === "f32") this._write(s.buf, e.data);
-    else {
-      this._write(s.qs, e.qs);
-      this._write(s.sc, e.scales);
-    }
-    // queue.writeBuffer only enqueues the copy. Waiting here gives callers a
-    // correctness barrier before they reuse the slot for compute.
-    await this.device.queue.onSubmittedWorkDone?.();
-    const dt = performance.now() - t0;
-
-    s.entry = e;
-    this.stats.uploads++;
-    this.stats.bytesMoved += packedEntryBytes(e);
-    this.stats.uploadMs += dt;
+  _gpuView(s, e) {
     return e.kind === "f32"
       ? { kind: "f32", buf: s.buf }
       : { kind: e.kind, qs: s.qs, sc: s.sc };
+  }
+
+  // Copy several CPU-backed weights into reusable named slots, then wait once.
+  // A layer needs multiple matrices at the same time, so batching the uploads
+  // avoids one queue drain per matrix.
+  async materializeMany(items) {
+    const out = new Map();
+    const dirty = [];
+    const t0 = performance.now();
+
+    for (const [key, e] of items) {
+      if (!e) throw new Error("cannot materialize empty weight " + key);
+      const s = this._ensureSlot(key, e);
+      out.set(key, this._gpuView(s, e));
+      if (s.entry === e) {
+        this.stats.cacheHits++;
+        continue;
+      }
+      if (e.kind === "f32") this._write(s.buf, e.data);
+      else {
+        this._write(s.qs, e.qs);
+        this._write(s.sc, e.scales);
+      }
+      dirty.push([s, e]);
+    }
+
+    if (dirty.length) {
+      await this.device.queue.onSubmittedWorkDone?.();
+      const dt = performance.now() - t0;
+      for (const [s, e] of dirty) {
+        s.entry = e;
+        this.stats.uploads++;
+        this.stats.bytesMoved += packedEntryBytes(e);
+      }
+      this.stats.uploadMs += dt;
+    }
+    return out;
+  }
+
+  // Copy one CPU-backed packed entry into a reusable named slot.
+  // Repeating the same entry in the same slot is a no-op.
+  async materialize(key, e) {
+    const out = await this.materializeMany([[key, e]]);
+    return out.get(key);
   }
 
   invalidate(key) {
