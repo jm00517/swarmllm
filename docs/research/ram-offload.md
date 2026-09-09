@@ -1,148 +1,144 @@
-# RAM-backed weight offload for VRAM-limited WebGPU nodes
+# WebGPU RAM weight offload
 
-Status: RFC / implementation scaffold.
+상태: 구현 진행 중.
 
-## Goal
+## 최종 목표
 
-Let a node contribute more model weight than fits in dedicated VRAM by keeping
-quantized weights in system RAM (or browser storage) and paging contiguous layer
-windows into a bounded set of GPU buffers.
+VRAM이 작은 WebGPU 노드가 시스템 RAM을 weight backing store로 사용해서,
+전용 VRAM보다 큰 모델 shard를 맡을 수 있게 한다.
 
-Example target: an RTX 4060 8 GB node with tens of GB of system RAM should be
-able to participate in a larger swarm without pledging only ~6-7 GB of weights.
+예시 목표:
 
-This is **not** "make system RAM behave like VRAM". WebGPU does not expose a
-portable host-visible storage-buffer residency API. The implementation must keep
-CPU copies and explicitly upload pages into GPUBuffer objects.
+- RTX 4060 8GB
+- 시스템 RAM 수십 GB
+- GPU weight budget 5~6GB
+- 나머지 Q4/Q8 weight는 RAM에 유지
+- 필요한 연속 layer window만 VRAM으로 page-in / page-out
 
-## Why this is not a small loader tweak
+이건 **시스템 RAM을 VRAM처럼 직접 쓰는 기능이 아니다.**
+WebGPU에는 portable한 host-visible storage-buffer residency API가 없으므로,
+CPU 쪽 packed weight를 유지하고 필요한 시점에 명시적으로 GPUBuffer로 업로드해야 한다.
 
-The current fast path assumes permanent GPU residency in three places:
+## 현재 구조에서 막히는 지점
 
-1. `streamEntryToGPU()` creates final GPU buffers while the tensor is arriving
-   and returns only the GPU copy.
-2. `gpuUploadEntry()` drops `e.qs/e.scales/e.data` after upload.
-3. `Qwen35Engine._init()` builds matvec ops and bind groups once, capturing
-   permanent GPUBuffer handles for every weight in every layer.
+현재 fast path는 weight가 GPU에 영구 상주한다고 가정한다.
 
-The execution path then records the whole local shard into one command encoder:
+1. `streamEntryToGPU()`가 tensor 다운로드 중 최종 GPUBuffer를 바로 만든다.
+2. `gpuUploadEntry()`는 GPU 업로드 뒤 `e.qs/e.scales/e.data`를 버린다.
+3. `Qwen35Engine._init()`은 각 weight의 permanent GPUBuffer를 캡처한 bind group을 한 번만 만든다.
+4. decode/prefill은 local shard의 모든 layer를 하나의 command encoder에 기록한 뒤 한 번 submit한다.
 
-- single-token decode: all local layers are encoded before submit;
-- batched prefill/verify: all local layers are also encoded before submit.
+따라서 loader만 수정해서는 RAM offload가 완성되지 않는다.
 
-Because CPU -> GPU uploads are asynchronous queue operations, a pager cannot
-replace one layer's buffers with the next layer in the middle of that single
-command buffer without restructuring the execution loop.
-
-## Proposed architecture
+## 목표 구조
 
 ```
 GGUF range / Cache API
         |
         v
 CPU packed-weight cache
-(q4/q8 nibbles + f16 scales)
+(Q4/Q8 nibbles + f16 scales)
         |
         v
 WeightPager
   - VRAM budget
-  - one or two layer windows
+  - residency window
   - upload / evict
   - optional double buffering
         |
         v
 Qwen35Engine
-  run window 0 -> submit
-  upload/prefetch window 1
-  run window 1 -> submit
+  window 0 실행 -> submit
+  window 1 page-in
+  window 1 실행 -> submit
   ...
 ```
 
-Keep **state**, not weights, resident:
+GPU에 계속 상주시킬 것:
 
 - DeltaNet recurrent state
 - convolution state
 - attention KV cache
-- activation scratch buffers
-- uniforms / pipeline objects
+- activation scratch buffer
+- uniform / pipeline object
+- 작은 norm / bias
 
-Page the large matrices:
+pageable 대상으로 둘 것:
 
-- attention projections
+- attention projection weight
 - FFN gate/up/down
-- DeltaNet projection matrices
-- optional LM head as a separate pageable object
+- DeltaNet projection matrix
+- 필요하면 LM head
 
-Norm vectors, biases and other small f32 tensors can stay resident.
+## 구현 단계
 
-## Implementation phases
+### Phase 0 — planner
 
-### Phase 0 - planner (this PR)
+완료.
 
-- pure contiguous-window planner in `engine/residency.js`
-- transfer-time lower-bound helper
-- unit tests
-- no runtime behavior change
+- `engine/residency.js`
+- 연속 layer window planner
+- 전송 시간 하한 계산
+- unit test
 
-### Phase 1 - retain CPU weights
+### Phase 1 — CPU packed weight 유지
 
-Touch `engine/gguf.js` and `room.js`.
+수정 대상:
 
-Add an alternate loading path that repacks q4/q8 into CPU-owned typed arrays and
-does **not** call `streamEntryToGPU()` / `gpuUploadEntry()` for pageable
-weights.
+- `engine/gguf.js`
+- `room.js`
 
-Use Cache API for persistent storage as today, but keep only the active shard's
-packed CPU entries in memory. An IndexedDB/file-backed page cache can be a later
-optimization.
+paged 모드에서는 Q4/Q8을 RAM의 typed array로 유지하고
+`streamEntryToGPU()` / `gpuUploadEntry()`를 우회한다.
 
-Estimated change: ~100-180 LOC.
+기존 fully-resident 경로는 그대로 유지한다.
 
-### Phase 2 - page object + budget
+예상 변경량: 약 100~180 LOC.
 
-New `engine/weight_pager.js`.
+### Phase 2 — WeightPager
 
-Responsibilities:
+새 파일:
 
-- track a user-specified VRAM budget;
-- own one or two reusable residency windows;
-- upload packed q4/q8 entries;
-- destroy evicted GPUBuffer objects;
-- expose `ensureWindow(lo, hi)`;
-- collect upload timing and bytes moved.
+- `engine/weight_pager.js`
 
-Estimated change: ~180-300 LOC plus tests.
+역할:
 
-### Phase 3 - dynamic layer bindings
+- user-defined VRAM budget
+- reusable residency window
+- upload / evict
+- transfer bytes / timing 수집
+- 가능하면 double buffering
 
-This is the largest change in `engine/qwen35.js`.
+예상 변경량: 약 180~300 LOC + tests.
 
-Today `buildLayer()`, `mv()`, `mvB()`, `guOp()`, and the batched layer
-tables create bind groups once against permanent buffers.
+### Phase 3 — Qwen35Engine paged binding
 
-Paged mode needs either:
+가장 큰 변경.
 
-A. rebuild the layer's weight-dependent ops/bind groups whenever a window becomes
-resident; or
+현재 `buildLayer()`, `mv()`, `mvB()`, `guOp()` 등이
+permanent GPUBuffer를 물고 있는 bind group을 생성한다.
 
-B. keep fixed-size GPU buffers and copy each incoming layer into reusable slots,
-so bind groups remain stable.
+paged 모드에서는 두 선택지가 있다.
 
-B is preferable. It avoids repeated bind-group allocation and is friendlier to
-browsers, but requires slot sizing by tensor shape/family.
+A. window가 바뀔 때 bind group을 다시 만든다.
 
-Estimated change: ~300-500 LOC.
+B. 고정 크기 GPU slot을 만들고 새 weight를 같은 slot에 복사해서 bind group은 유지한다.
 
-### Phase 4 - split command submission by residency window
+B를 우선한다.
+브라우저에서 bind-group churn을 줄일 수 있고 실행 경로도 더 예측 가능하다.
 
-Refactor:
+예상 변경량: 약 300~500 LOC.
 
-- `_runBatchAndRead()`
-- `prefillTokens()`
-- single-token layer execution
-- hidden-state worker execution
+### Phase 4 — residency window 단위 command submission
 
-from "encode all layers then submit once" to roughly:
+현재:
+
+```
+모든 local layer encode
+-> submit 1회
+```
+
+paged 모드:
 
 ```js
 for (const window of pager.windows) {
@@ -150,65 +146,70 @@ for (const window of pager.windows) {
   const enc = device.createCommandEncoder();
   for (const layer of window.layers) encodeLayer(enc, layer);
   device.queue.submit([enc.finish()]);
-  // prefetch next window where possible
 }
 ```
 
-For correctness, the activation buffer and recurrent/KV state remain on GPU
-between submits.
+수정 대상:
 
-Estimated change: ~150-250 LOC.
+- single-token decode
+- `_runBatchAndRead()`
+- `prefillTokens()`
+- speculative verify
+- worker hidden-state execution
 
-### Phase 5 - room/UI integration
+activation과 recurrent/KV state는 window 사이에도 GPU에 유지한다.
 
-Separate two concepts that are currently represented by `contribGB`:
+예상 변경량: 약 150~250 LOC.
 
-- resident GPU weight budget
+### Phase 5 — room/UI
+
+현재 `contribGB` 하나로 표현되는 용량을 분리한다.
+
+- GPU resident weight budget
 - CPU/offload weight budget
 
-The shard planner should avoid assigning a node more than its CPU budget, while
-the local pager uses only its GPU budget at a time.
-
-Example:
+예:
 
 ```
 GPU weight budget: 5.5 GB
 CPU weight budget: 28 GB
 ```
 
-Estimated change: ~100-180 LOC.
+shard planner는 CPU budget보다 큰 shard를 배정하지 않고,
+local pager는 GPU budget만큼만 동시에 resident하게 만든다.
 
-## Rough scope
+예상 변경량: 약 100~180 LOC.
 
-A useful Qwen3.5/3.8 paged prototype is likely **800-1,400 LOC** including tests
-and instrumentation. DenseEngine support can follow after Qwen35Engine works.
+## 대략적인 전체 규모
 
-The hard part is not GGUF loading. It is breaking the assumption that every
-weight buffer is permanently resident while preserving the optimized batched and
-speculative paths.
+Qwen3.5/3.8에서 실제로 쓸 수 있는 prototype은
+**800~1,400 LOC** 정도로 예상한다.
 
-## Expected performance
+핵심 난점은 GGUF loading 자체가 아니라
+**모든 weight가 영구 GPU resident라는 엔진 가정을 깨는 것**이다.
 
-This mode trades capacity for speed.
+## 성능
 
-For dense models, every token reads essentially all assigned weight bytes. If a
-node must move 20 GB/token over an effective 12 GB/s PCIe path, the transfer
-lower bound alone is ~1.67 s/token before compute.
+이 기능은 속도 향상이 아니라 **용량 확장 모드**다.
 
-Therefore the first useful targets are:
+Dense 모델은 token마다 맡은 weight를 거의 전부 읽는다.
 
-1. shards that exceed VRAM only modestly;
-2. large prefill batches, where one uploaded window can serve many prompt tokens;
-3. future MoE models, where only selected experts need to be paged;
-4. double-buffered upload/compute overlap.
+예를 들어 20GB/token을 실효 12GB/s PCIe로 옮기면
+전송 시간 하한만 약 1.67초/token이다.
 
-The room should prefer ordinary fully-resident sharding whenever aggregate VRAM
-is sufficient, and use RAM offload only as an explicit capacity mode.
+따라서 우선순위는:
 
-## Non-goals for the first implementation
+1. VRAM을 조금 초과하는 shard
+2. 한 번 page-in한 weight를 여러 prompt token에 재사용하는 batched prefill
+3. 향후 MoE expert paging
+4. upload/compute double buffering
 
-- transparent OS-managed shared GPU memory;
-- treating `adapter.limits.maxBufferSize` as available VRAM;
-- paging recurrent/KV state;
-- arbitrary model architectures;
-- promising native-like decode speed while paging dense weights.
+aggregate VRAM이 충분하면 기존 fully-resident sharding을 기본값으로 유지한다.
+
+## 1차 구현에서 하지 않을 것
+
+- OS의 shared GPU memory를 직접 제어한다고 가정
+- `adapter.limits.maxBufferSize`를 실제 사용 가능한 VRAM으로 간주
+- recurrent/KV state paging
+- 모든 model architecture 지원
+- dense paging에서도 resident mode와 비슷한 decode 속도를 약속
