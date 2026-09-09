@@ -326,7 +326,13 @@ export class Qwen35Engine {
     if (hasEmbed || hasHead) this.cpuEmbed = weights.embed;
     if (hasHead) {
       this.finalNorm = up(weights.finalNorm);
-      if (weights.head) this.headEntry = up(weights.head);
+      if (this.pagedWeights) {
+        // LM head도 layer weight와 같은 pager slot을 재사용한다. tied 모델은
+        // CPU embedding table 자체를 head backing store로 쓴다.
+        this.cpuHeadEntry = weights.head || weights.embed;
+        this.headEntry = null;
+        this.headOp = null;
+      } else if (weights.head) this.headEntry = up(weights.head);
       else { // tied: upload embed for the head but keep CPU copy for row lookups
         const e = weights.embed;
         this.headEntry = { kind: e.kind, qs: this._buf(e.qs, GPUBufferUsage.STORAGE), sc: this._buf(e.scales, GPUBufferUsage.STORAGE) };
@@ -338,7 +344,7 @@ export class Qwen35Engine {
       this.stageArg = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
       this.bgArgmax = this._bg(this.pipes.argmax, 1, [this.logits, this.argBuf, this._buf(new Uint32Array([vocab, 0, 0, 0]), GPUBufferUsage.UNIFORM)]);
       this.bgFinalNorm = bgNorm(this.x, this.finalNorm, this.xn);
-      this.headOp = mv(this.headEntry, this.xn, this.logits, vocab, dim);
+      if (!this.pagedWeights) this.headOp = mv(this.headEntry, this.xn, this.logits, vocab, dim);
     }
 
     this.bgCommonFor = {};
@@ -517,6 +523,14 @@ export class Qwen35Engine {
       this.device.queue.submit([enc.finish()]);
     }
     await this.device.queue.onSubmittedWorkDone();
+  }
+
+  async _preparePagedHead() {
+    if (!this.pagedWeights || !this.hasHead) return;
+    // s0:w0은 다음 token의 첫 window가 다시 덮어쓴다. 별도 head slot을
+    // 만들지 않아 page budget 바깥으로 VRAM이 늘어나는 걸 막는다.
+    this.headEntry = await this.weightPager.materialize("s0:w0", this.cpuHeadEntry);
+    this.headOp = this._mv(this.headEntry, this.xn, this.logits, this.dims.vocab, this.dims.dim);
   }
 
   _encodeLayer(enc, i) { this._encodeLayerR(enc, this.layers[i], this.pos); }
@@ -1153,7 +1167,8 @@ export class Qwen35Engine {
 
   async headFromHidden(xIn) {
     const { vocab } = this.dims;
-    this.device.queue.writeBuffer(this.x, 0, xIn);
+    if (xIn) this.device.queue.writeBuffer(this.x, 0, xIn);
+    if (this.pagedWeights) await this._preparePagedHead();
     const enc = this.device.createCommandEncoder();
     {
       const p = enc.beginComputePass();
@@ -1173,7 +1188,7 @@ export class Qwen35Engine {
     this.device.queue.writeBuffer(this.x, 0, this._embedRowF32(tokenId));
     if (this.pagedWeights) {
       await this._runPagedLayers();
-      const logits = await this.headFromHidden(await this._readback(this.x, this.stageX, this.dims.dim));
+      const logits = await this.headFromHidden(null);
       this.pos++;
       return logits;
     }
