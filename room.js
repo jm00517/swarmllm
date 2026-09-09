@@ -975,6 +975,7 @@ async function aiGenerate(textArg, who) {
   const asker = who || myName;
   if (!text || ai.busy === "gen" || !ai.engine) return;
   try { ai.engine.reset?.(); } catch {}
+  const pagerStart = ai.engine.weightPager?.snapshot?.() || null;
   ai.pos = 0;
   broadcastAll({ t: "ai-reset" });
   ai.busy = "gen";
@@ -1136,7 +1137,12 @@ async function aiGenerate(textArg, who) {
       }
     }
     const secs = (performance.now() - t0) / 1000;
-    const stats = `${count} tok · ${(count / secs).toFixed(1)} tok/s · ${ai.chain.length + 1} devices${capped ? ` · stopped: context full (${MAX_SEQ} tokens)` : ""}`;
+    const pagerEnd = ai.engine.weightPager?.snapshot?.() || null;
+    const paging = pagerEnd && pagerStart
+      ? ` · paged ${((pagerEnd.bytesMoved - pagerStart.bytesMoved) / 2 ** 30).toFixed(2)} GB` +
+        ` / ${((pagerEnd.uploadMs - pagerStart.uploadMs) / 1000).toFixed(1)}s upload`
+      : "";
+    const stats = `${count} tok · ${(count / secs).toFixed(1)} tok/s · ${ai.chain.length + 1} devices${paging}${capped ? ` · stopped: context full (${MAX_SEQ} tokens)` : ""}`;
     chatBotEnd(reply, stats);
     broadcastAll({ t: "ai-gendone", stats });
     mascot("Done. Anyone in the room can ask the next one.");
