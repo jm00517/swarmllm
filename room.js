@@ -568,6 +568,7 @@ const RAM_PARAMS = new URLSearchParams(location.search);
 const RAM_OFFLOAD = RAM_PARAMS.get("ramOffload") === "1";
 const RAM_GPU_WEIGHT_GB = Math.max(0.25, Number(RAM_PARAMS.get("gpuWeightGB")) || 2);
 const RAM_GPU_WEIGHT_BYTES = Math.floor(RAM_GPU_WEIGHT_GB * 2 ** 30);
+const RAM_WINDOW_LAYERS = Math.max(1, Math.floor(Number(RAM_PARAMS.get("ramWindowLayers")) || 1));
 
 let ai = {
   engine: null, tok: null, cfg: null, device: null,
@@ -750,10 +751,11 @@ async function aiLoadShard(modelKey, range, hasEmbed, hasHead) {
       keepCpuWeights: RAM_OFFLOAD,
       pagedWeights: RAM_OFFLOAD,
       gpuWeightBudgetBytes: RAM_GPU_WEIGHT_BYTES,
+      pagedWindowLayers: RAM_WINDOW_LAYERS,
     });
     if (RAM_OFFLOAD) {
       const ps = ai.engine.weightPager?.snapshot?.();
-      log("swarm", `RAM weight paging 활성 · page budget ${RAM_GPU_WEIGHT_GB.toFixed(2)} GB` +
+      log("swarm", `RAM weight paging 활성 · page budget ${RAM_GPU_WEIGHT_GB.toFixed(2)} GB · window ${RAM_WINDOW_LAYERS} layer` +
         (ps ? ` · allocated ${(ps.allocatedBytes / 2 ** 20).toFixed(0)} MiB at init` : ""));
     }
   } else if (M.kind === "gguf") {
