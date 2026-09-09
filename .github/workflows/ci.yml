@@ -1,6 +1,6 @@
 name: CI
 on:
-  push: { branches: [main, faster-kernels] }
+  push: { branches: [main, faster-kernels, rfc/ram-offload-webgpu] }
   pull_request:
 jobs:
   check:
@@ -13,7 +13,7 @@ jobs:
         with: { node-version: 22 }
       - name: Syntax check (engine, tests, benchmarks)
         run: |
-          for f in engine/*.js tests/*.js benchmarks/*.js; do node --check "$f"; done
+          for f in engine/*.js room.js room/*.js tests/*.js benchmarks/*.js; do node --check "$f"; done
       - name: Unit tests (no GPU)
         run: deno test --allow-read tests/unit
       - name: Kernel generator sanity
