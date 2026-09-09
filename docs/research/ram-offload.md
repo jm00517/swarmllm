@@ -132,15 +132,17 @@ GPU 완료를 기다린다.
 
 1차 single-token 경로 구현.
 
-현재 paged 모드는 **window size = 1 layer**로 동작한다.
+multi-layer window까지 연결했다.
 
 ```js
-for (const layer of localLayers) {
-  await pager.materialize(layer.weights);
-  encode(layer);
+for (const window of localLayers.chunk(windowLayers)) {
+  await pager.materialize(window.weights);
+  encode(window.layers);
   submit();
 }
 ```
+
+URL의 `ramWindowLayers`로 window 크기를 바꿀 수 있다.
 
 적용됨:
 
@@ -148,10 +150,11 @@ for (const layer of localLayers) {
 - host `embedRun()`
 - worker `runHidden()`
 - solo `forwardToken()`
+- 1/N layer window 실행
 
 paged 모드에서는 아직 batched prefill / speculative decode를 비활성화하고
-기존 single-token 경로로 fallback한다. 정확성 확인 후 multi-layer window,
-batched path, double buffering 순서로 다시 올릴 예정이다.
+기존 single-token 경로로 fallback한다. 다음은 batched path 복구와
+double buffering이다.
 
 activation과 recurrent/KV state는 layer 전환 사이에도 GPU에 유지한다.
 
@@ -213,11 +216,12 @@ aggregate VRAM이 충분하면 기존 fully-resident sharding을 기본값으로
 개발 서버에서 Qwen3.8-27B를 선택한 뒤 URL query로 paging을 켠다.
 
 ```
-?ramOffload=1&gpuWeightGB=2
+?ramOffload=1&gpuWeightGB=2&ramWindowLayers=1
 ```
 
 - `ramOffload=1`: CPU-backed GGUF + Qwen35 pager 활성
 - `gpuWeightGB`: pageable weight slot에 허용할 VRAM budget
+- `ramWindowLayers`: 한 번 page-in해서 같은 command buffer에서 실행할 layer 수
 
 현재 `gpuWeightGB`는 **전체 GPU 사용량이 아니라 pageable matrix slot budget**이다.
 LM head, KV cache, recurrent state, working buffer는 별도 resident이므로 8GB GPU에서
